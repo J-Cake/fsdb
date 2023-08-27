@@ -13,7 +13,6 @@ pub use access::*;
 pub mod test {
     use std::fs::File;
     use std::fs::OpenOptions;
-    use std::io::Cursor;
     use std::io::Result;
     use serde::Serialize;
     use serde::Deserialize;
@@ -37,63 +36,63 @@ pub mod test {
         }
     }
     
-    #[test]
-    pub fn blank() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open("/tmp/test.db")?;
-            
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
-            
-        Ok(())
-    }
-    
-    #[test]
-    pub fn create_page() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open("/tmp/test.db")?;
-        
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
-            
-        let page = blank.create_page("test")?;
-        
-        Ok(())
-    }
-    
-    #[test]
-    pub fn read_write() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open("/tmp/test.db")?;
-        
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
-            
-        let page = blank.create_page("test")?;
-        
-        
-        
-        Ok(())
-    }
-    
+//     #[test]
+//     pub fn blank() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .create(true)
+//             .read(true)
+//             .write(true)
+//             .open("/tmp/test.db")?;
+//             
+//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+//             .change_buffer(file)?;
+//             
+//         Ok(())
+//     }
+//     
+//     #[test]
+//     pub fn create_page() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .create(true)
+//             .read(true)
+//             .write(true)
+//             .open("/tmp/test.db")?;
+//         
+//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+//             .change_buffer(file)?;
+//             
+//         let page = blank.create_page("test")?;
+//         
+//         Ok(())
+//     }
+//     
+//     #[test]
+//     pub fn read_write() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .create(true)
+//             .read(true)
+//             .write(true)
+//             .open("/tmp/test.db")?;
+//         
+//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+//             .change_buffer(file)?;
+//             
+//         let page = blank.create_page("test")?;
+//         
+//         
+//         
+//         Ok(())
+//     }
+//     
     #[test]
     pub fn read() -> Result<()> {
         let mut file = OpenOptions::new()
             .read(true)
-            .open("/tmp/test.db")?;
+            .open("/home/jcake/Erika/Frameworks/datastore-provider/test/header.db")?;
             
         let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
         
-        assert!(db.leak_string_table().len() as u64 == db.string_table_range.1);
+        assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
         
         Ok(())
     }

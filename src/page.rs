@@ -17,7 +17,7 @@ pub(crate) struct PageDescriptor {
     /// When the page was created - determined by querying the journal
     pub(crate) created: SystemTime,
     /// A list of chunks ((start, length)) in order 
-    pub(crate) inodes: Vec<(u64, u64)>
+    pub(crate) inodes: Vec<crate::Array>
 }
 
 /// Information about what happened, when
@@ -41,7 +41,7 @@ pub enum HistoryEntry<'a> {
     /// The page's inode table was modified
     INodeListModified {
         /// The previous inode list
-        prev_inodes: Vec<(u64, u64)>
+        prev_inodes: Vec<crate::Array>
     },
     /// The page was deleted
     Deleted
@@ -51,7 +51,7 @@ pub enum HistoryEntry<'a> {
 pub struct Page<'a, Buffer, Allocate>
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>> 
+    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
 {
     pub(crate) db: crate::DBAgent<Buffer, Allocate>,
     pub(crate) history: &'a [(SystemTime, HistoryEntry<'a>)],
@@ -63,7 +63,7 @@ where
 impl<'a, Buffer, Allocate> Seek for Page<'a, Buffer, Allocate> 
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>> 
+    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
 {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
@@ -74,7 +74,7 @@ where
                 self.index = (self.index as i64 + offset) as u64;
             },
             SeekFrom::End(offset) => {
-                let total = self.page_descriptor.inodes.iter().map(|i| i.1).sum::<u64>() as i64;
+                let total = self.page_descriptor.inodes.iter().map(|i| i.length).sum::<u64>() as i64;
                 if -offset > total as i64 {
                     return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek beyond end"));
                 } else {
@@ -90,13 +90,13 @@ where
 impl<'a, Buffer, Allocate> Read for Page<'a, Buffer, Allocate> 
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>> 
+    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut running_size: u64 = 0;
         let mut backing = self.db.try_borrow_mut()?;
             
-        for (start, len) in self.page_descriptor.inodes
+        for crate::Array { length: len, offset: start } in self.page_descriptor.inodes
             .iter() {
                 
             // Read at most one chunk
@@ -118,14 +118,14 @@ where
 impl<'a, Buffer, Allocate> Write for Page<'a, Buffer, Allocate> 
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>> 
+    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         {
             let mut running_size: u64 = 0;
             let mut backing = self.db.try_transparent_borrow_mut()?;
                 
-            for (start, len) in self.page_descriptor.inodes
+            for crate::Array { length: len, offset: start } in self.page_descriptor.inodes
                 .iter() {
                     
                 // Read at most one chunk

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::BufWriter;
+use std::io::BufReader;
 use std::io::Cursor;
 use std::io::Error;
 use std::io::Read;
@@ -8,6 +8,7 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Result;
 use std::ops::DerefMut;
+use std::ops::Deref;
 use std::time::SystemTime;
 use std::cell::RefCell;
 use std::cell::RefMut;
@@ -18,21 +19,36 @@ use serde::de::DeserializeOwned;
 
 use crate::PageDescriptor;
 
+#[inline]
+fn round(x: u64, n: u64) -> u64 {
+    x + (n - x % n)
+}
+
+macro_rules! str {
+    ($strtab:expr, $n:expr) => ($strtab.get($n as usize).ok_or(Error::new(std::io::ErrorKind::NotFound, format!("No string found for index {}", $n))));
+}
+
 /// A proxy which provides a reading and writing interface to the database's buffer.
 #[derive(Clone)]
 pub(crate) struct DBAgent<Buffer, Allocate> 
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>>
+    Allocate: FnMut(u64) -> Result<Vec<Array>>
 {
     buffer: Rc<RefCell<Buffer>>,
     allocate: Allocate
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct Array {
+    pub length: u64,
+    pub offset: u64,
+}
+
 impl<Buffer, Allocate> DBAgent<Buffer, Allocate> 
 where 
     Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<(u64, u64)>>
+    Allocate: FnMut(u64) -> Result<Vec<Array>>
 {
     pub fn try_borrow_mut(&self) -> Result<RefMut<Buffer>> {
         self.buffer.try_borrow_mut()
@@ -48,7 +64,7 @@ where
             .map_err(Error::other)
     }
     
-    pub fn allocate_chunks(&mut self, min_size: u64) -> Result<Vec<(u64, u64)>> {
+    pub fn allocate_chunks(&mut self, min_size: u64) -> Result<Vec<Array>> {
         (self.allocate)(min_size)
     }
 }
@@ -57,12 +73,12 @@ where
 pub struct Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadata: Serialize + DeserializeOwned + Clone {
     /// The underlying data source. As long as it supports Read, Write and Seek operations, this can be anything.
     pub(crate) backing: Rc<RefCell<Buffer>>,
-    /// Offset of the inode table, and the number of elements in it.
-    pub(crate) inode_table_range: (u64, u64),
-    /// Offset of the string table, and the number of elements in it
-    pub(crate) string_table_range: (u64, u64),
-    /// Offset of the history table, and the number of elements in it
-    pub(crate) history_table_range: (u64, u64),
+    /// Number of elements in inode table + Offset
+    pub(crate) inode_table_range: Array,
+    /// Number of elements in string table + Offset
+    pub(crate) string_table_range: Array,
+    /// Number of elements in history table + Offset
+    pub(crate) history_table_range: Array,
     
     inode_table: HashMap<String, PageDescriptor>,
     string_table: RefCell<Vec<String>>,
@@ -73,40 +89,54 @@ pub struct Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadat
 
 impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadata: Serialize + DeserializeOwned + Clone {
     pub fn open(mut backing: Buffer) -> Result<Self> {
-        backing.seek(std::io::SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut backing);
+        reader.seek(std::io::SeekFrom::Start(0))?;        
         
         let mut buf = vec![0u8; 4 + 4 + 4 + 4 + (4 * (2 * 8))];
-        backing.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf)?;
         if &buf[0..4] != b"FSDB" { return Err(Error::other("Invalid Magic Number")); }
         if buf[4..8] != [0x01, 0, 0, 0] { return Err(Error::other("Unrecognised version")); }
         
-        let inode_table_range = (u64::from_le_bytes(buf[16..24]
+        let inode_table_range = Array {
+            length: u64::from_le_bytes(buf[16..24]
                 .try_into()
-                .map_err(Error::other)?), u64::from_le_bytes(buf[24..32]
+                .map_err(Error::other)?),
+            offset: u64::from_le_bytes(buf[24..32]
                 .try_into()
-                .map_err(Error::other)?));
+                .map_err(Error::other)?)
+        };
+        
+        let string_table_range = Array {
+            length: u64::from_le_bytes(buf[32..40]
+                .try_into()
+                .map_err(Error::other)?),
+            offset: u64::from_le_bytes(buf[40..48]
+                .try_into()
+                .map_err(Error::other)?)
+        };
                 
-        let string_table_range = (u64::from_le_bytes(buf[32..40]
+        let history_table_range = Array {
+            length: u64::from_le_bytes(buf[48..56]
                 .try_into()
-                .map_err(Error::other)?), u64::from_le_bytes(buf[40..48]
+                .map_err(Error::other)?),
+            offset: u64::from_le_bytes(buf[56..64]
                 .try_into()
-                .map_err(Error::other)?));
-                
-        let history_table_range = (u64::from_le_bytes(buf[48..56]
-                .try_into()
-                .map_err(Error::other)?), u64::from_le_bytes(buf[56..64]
-                .try_into()
-                .map_err(Error::other)?));
+                .map_err(Error::other)?)
+        };
         
         let backing = Rc::new(RefCell::new(backing));
         
+        let strtab = RefCell::new(Self::parse_string_table(Rc::clone(&backing)
+            .try_borrow_mut()
+            .map_err(Error::other)?, string_table_range)?);
+        
+        let inodetab = Self::parse_inode_table(Rc::clone(&backing)
+            .try_borrow_mut()
+            .map_err(Error::other)?, strtab.borrow(), inode_table_range)?;
+        
         let x = Ok(Self {
-            inode_table: Self::parse_inode_table(Rc::clone(&backing)
-                .try_borrow_mut()
-                .map_err(Error::other)?, inode_table_range.0, inode_table_range.1)?,
-            string_table: RefCell::new(Self::parse_string_table(Rc::clone(&backing)
-                .try_borrow_mut()
-                .map_err(Error::other)?, string_table_range.0, string_table_range.1)?),
+            inode_table: inodetab,
+            string_table: strtab,
             
             inode_table_range,
             string_table_range,
@@ -119,11 +149,13 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
                     .try_into()
                     .map_err(Error::other)?));
                     
-                let mut s = vec![0u8; meta.1 as usize];
-                backing
+                let mut s = vec![0u8; meta.0 as usize];
+                let mut backing: RefMut<Buffer> = backing
                     .try_borrow_mut()
-                    .map_err(Error::other)?
-                    .read_exact(&mut s)?;
+                    .map_err(Error::other)?;
+                    
+                backing.seek(SeekFrom::Start(meta.1))?;
+                backing.read_exact(&mut s)?;
                 
                 ron::de::from_bytes::<Metadata>(&s)
                     .map_err(Error::other)?
@@ -148,10 +180,10 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         
         let mut header: Cursor<Vec<u8>> = Cursor::new(vec![
             &b"FSDB"[..], &u32::to_le_bytes(0x01)[..], &u64::to_le_bytes(0x00)[..],
-            &u64::to_le_bytes(data_offset)[..], &u64::to_le_bytes(0x01)[..], // INode Table
-            &u64::to_le_bytes(data_offset + 0x100)[..], &u64::to_le_bytes(0x02)[..], // String Table
-            &u64::to_le_bytes(data_offset + 0x200)[..], &u64::to_le_bytes(0x01)[..], // History Table
-            &u64::to_le_bytes(0x50)[..], &u64::to_le_bytes(meta.len() as u64)[..],
+            &u64::to_le_bytes(0x01)[..], &u64::to_le_bytes(data_offset)[..], // INode Table
+            &u64::to_le_bytes(0x02)[..], &u64::to_le_bytes(data_offset + 0x100)[..], // String Table
+            &u64::to_le_bytes(0x01)[..], &u64::to_le_bytes(data_offset + 0x200)[..], // History Table
+            &u64::to_le_bytes(meta.len() as u64)[..], &u64::to_le_bytes(0x50)[..],
             &meta[..]
         ]
             .into_iter()
@@ -166,9 +198,9 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(Database {
             raw_header: raw_header.to_vec(),
             backing: Rc::new(RefCell::new(header)),
-            inode_table_range: (data_offset, 1),
-            string_table_range: (data_offset + 0x100, 2),
-            history_table_range: (data_offset + 0x200, 1),
+            inode_table_range: Array { length: 1, offset: data_offset },
+            string_table_range: Array { length: 2, offset: data_offset + 0x100 },
+            history_table_range: Array { length: 1, offset: data_offset + 0x200 },
             inode_table: vec![("/".to_string(), PageDescriptor {
                 name: "/".to_string(),
                 access_control_list: vec![crate::Access::ReadWriteExecute("*".to_string())],
@@ -200,13 +232,13 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         })
     }
     
-    fn parse_string_table(mut backing: RefMut<Buffer>, start: u64, len: u64) -> Result<Vec<String>> {
+    fn parse_string_table(mut backing: RefMut<Buffer>, arr: Array) -> Result<Vec<String>> {
         let mut buf = Cursor::new(vec![0u8; 512]);
         let mut strtab = vec![];
-        backing.seek(std::io::SeekFrom::Start(start))?;
+        let offset = backing.seek(std::io::SeekFrom::Start(arr.offset))?;
         
         // TODO: If an EOF is reached while attempting to fill the buffer, despite the potential validity of the descriptors, we will receive an error. 
-        while strtab.len() < len as usize {
+        while strtab.len() < arr.length as usize {
             let buffer = {
                 let mut buffer = Vec::new();
                 buffer.extend(buf.get_ref());
@@ -231,10 +263,10 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         
     pub(crate) fn get_string_table(&mut self) -> Result<Vec<String>> {
         Self::parse_string_table(self.backing.try_borrow_mut()
-            .map_err(Error::other)?, self.string_table_range.0, self.string_table_range.1)
+            .map_err(Error::other)?, self.string_table_range)
     }
     
-    pub fn create_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<(u64, u64)>> + 'a>>> {
+    pub fn create_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<Array>> + 'a>>> {
         let path = path.to_string();
         
         if self.inode_table.contains_key(&path) {
@@ -260,7 +292,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         })
     }
     
-    pub fn open_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<(u64, u64)>> + 'a>>> {
+    pub fn open_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<Array>> + 'a>>> {
         let path = path.to_string();
         
         let page = self.inode_table.get(&path)
@@ -278,89 +310,69 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         })
     }
     
-    fn parse_inode_table(mut backing: RefMut<Buffer>, start: u64, len: u64) -> Result<HashMap<String, PageDescriptor>> {
-        let mut page_table = HashMap::new();
-        backing.seek(std::io::SeekFrom::Start(start))?;
-        let mut buf = Cursor::new(Vec::new());
+    fn parse_inode_table(mut backing: RefMut<Buffer>, strtab: Ref<Vec<String>>, arr: Array) -> Result<HashMap<String, PageDescriptor>> {
+        let mut buf = BufReader::new(backing.deref_mut());
+        let mut map = HashMap::new();
         
-        // TODO: If an EOF is reached while attempting to fill the buffer, despite the potential validity of the descriptors, we will receive an error. 
-        while page_table.len() < len as usize {            
-            // Join as an optimisation to reduce the number of reads we have to do. 
-            // Since reading in 512 byte increments allows us to have a more predictable read call amount, 
-            // we have to account for the fact that each read may yield anywhere between partial and multiple page descriptors.
-            // As such we're creating a buffer which is persisted between calls and used in the next call. 
-            // This potentially enlarged buffer is parsed-to-end, and any bytes which extend beyond the expected end of the inode table are disregarded, as we can always re-read them. 
-            let mut buffer = {
-                let mut buffer = Vec::new();
-                buffer.extend(buf.get_ref());
-                buffer.reserve(512);
-                buffer.extend_from_slice(&vec![0x00; buffer.capacity() - buf.get_ref().len()]);
-                backing.read_exact(&mut buffer[buf.get_ref().len()..])?;
-                buffer
-            };
+        let strtab = strtab.deref();
+        
+        let offset = buf.seek(SeekFrom::Start(arr.offset))?;
+        
+        while (map.len() as u64) < arr.length {
+            // Read the necessary information first.
             
-            // At this point the buffer will be at least 512 bytes long
-            let page_name = u64::from_le_bytes(buffer[0..8].try_into().map_err(Error::other)?);
-            let acl_len = u16::from_le_bytes(buffer[8..10].try_into().map_err(Error::other)?) as u64;
+            // u64 + u16
+            let mut page_header = [0u8; 8 + 2];
+            buf.read_exact(&mut page_header)?;
             
-            let chunks_offset = 10 + (1 + 8) * acl_len;
+            let page_name = u64::from_le_bytes(page_header[0..8].try_into().map_err(Error::other)?);
+            let acl_len = u16::from_le_bytes(page_header[8..10].try_into().map_err(Error::other)?) as u64;
             
-            // since we now know at least how much more space we need, we'll increase the buffer to that amount, and fill it
-            buffer.reserve(chunks_offset as usize + 8 - buffer.len());
-            // since the buffer already contains 512 bytes, the extra capacity from before will be unreserved, hence, by subtracting the difference between those, we know the remaining volume to fill
-            let range = buffer.len()..buffer.capacity();
-            backing.read_exact(&mut buffer[range])?;
+            // (u8 + u64) * acl_len + %0x10
+            let mut acl = vec![0u8; round((1 + 8) * acl_len as u64, 0x10) as usize - 2];
+            buf.read_exact(&mut acl)?;
             
-            // ACLs are (u8, u64) pairs which act as hints to the database to regulate access control.
-            // The values represent a customisable permission system, allowing specifying up to 8 unrelated permissions, 
-            // as well as an index into the string table, which can be used for any purpose such as an email address. 
-            let acl: Vec<crate::Access> = buffer[10..chunks_offset as usize]
-                .chunks(16)
-                .map(|i| match i[0] {
-                    0b000 => crate::Access::None(format!("")), // TODO: Replace with strtab lookup
-                    0b001 => crate::Access::Read(format!("")), // TODO: Replace with strtab lookup
-                    0b011 => crate::Access::ReadWrite(format!("")), // TODO: Replace with strtab lookup
-                    0b111 => crate::Access::ReadWriteExecute(format!("")), // TODO: Replace with strtab lookup
-                    0b101 => crate::Access::ReadExecute(format!("")), // TODO: Replace with strtab lookup
-                    perm => crate::Access::Custom(format!(""), perm), // TODO: Replace with strtab lookup
-                })
-                .collect();
+            // u64
+            let mut chunk_len = [0u8; 8];
+            buf.read_exact(&mut chunk_len)?;
+            
+            let chunk_len = u64::from_le_bytes(chunk_len);
+            
+            // (u64 + u64) * chunk_len
+            let mut chunk_ranges = vec![0u8; 2 * 8 * chunk_len as usize];
+            buf.read_exact(&mut chunk_ranges)?;
+            
+            let name: &String = str!(strtab, page_name)?;
                 
-            // realign cursor to nearest 16th byte
-            let chunks_offset = chunks_offset + (0x10 - ((1 + 8) * acl_len % 0x10));
-            
-            let chunk_len = u64::from_le_bytes(buffer[chunks_offset as usize..chunks_offset as usize + 8].try_into().map_err(Error::other)?);
-            let total_space = chunks_offset + 8 + (2 * 8 * chunk_len);
-            
-            buffer.reserve(total_space as usize - buffer.len());
-            let range = buffer.len()..buffer.capacity();
-            backing.read_exact(&mut buffer[range])?;
-            
-            // This table contains an array of (offset,length) pairs, each of the u64 type. The bytes expressed by these ranges, concatenated together form the page content. 
-            let chunks: Vec<(u64, u64)> = buffer[chunks_offset as usize + 8..total_space as usize]
-                .chunks(16)
-                .map(|i| Ok((
-                    u64::from_le_bytes(i[0..8].try_into().map_err(Error::other)?),
-                    u64::from_le_bytes(i[8..16].try_into().map_err(Error::other)?)
-                )))
-                .collect::<Result<Vec<(u64, u64)>>>()?;
-            
-            let page_name = format!("Page: {}", page_name); // TODO replace with strtab lookup
-            if let Some(page) = page_table.insert(page_name.to_owned(), PageDescriptor {
-                name: page_name,
-                access_control_list: acl,
-                inodes: chunks,
-                modified: SystemTime::now(), // TODO: Replace with history table lookup
-                created: SystemTime::now() // TODO: Replace with history table lookup
-            }) {
-                return Err(Error::other(format!("Duplicate page name found: {}", page.name)));
-            }
-            
-            buf.seek(SeekFrom::Start(0))?;
-            buf.write_all(&buffer[total_space as usize..])?;
+            map.insert(
+                name.clone(),
+                PageDescriptor {
+                    name: name.clone(),
+                    access_control_list: acl[0..(1 + 8) * acl_len as usize]
+                        .chunks(1 + 8) // u8 + u64
+                        .map(|i| Ok(match i[0] {
+                            0b000 => crate::Access::None(str!(strtab, i[1])?.clone()),
+                            0b001 => crate::Access::Read(str!(strtab, i[1])?.clone()),
+                            0b011 => crate::Access::ReadWrite(str!(strtab, i[1])?.clone()),
+                            0b111 => crate::Access::ReadWriteExecute(str!(strtab, i[1])?.clone()),
+                            0b101 => crate::Access::ReadExecute(str!(strtab, i[1])?.clone()),
+                            perm => crate::Access::Custom(str!(strtab, i[1])?.clone(), perm),
+                        }))
+                        .collect::<Result<Vec<crate::Access>>>()?,
+                    inodes: chunk_ranges
+                        .chunks(8 + 8) // u64 + u64
+                        .map(|i| Ok(Array {
+                            length: u64::from_le_bytes(i[0..8].try_into().map_err(Error::other)?),
+                            offset: u64::from_le_bytes(i[8..16].try_into().map_err(Error::other)?)
+                        }))
+                        .collect::<Result<Vec<Array>>>()?,
+                    modified: SystemTime::now(),
+                    created: SystemTime::now(),
+                }
+            );
         }
         
-        Ok(page_table)
+        Ok(map)
     }
     
     pub fn write_header(&mut self) -> Result<()> {
@@ -399,7 +411,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         let string_offset = (inode_offset + data.len() as u64) + 0x100 & !0x100; // Align to next 0x100th byte
         let string_length = self.string_table.borrow().len() as u64;
         
-        backing.seek(SeekFrom::Start(string_offset));
+        backing.seek(SeekFrom::Start(string_offset))?;
         let data = self.serialise_string_table()?;
         backing.write_all(&data)?;
         
@@ -461,8 +473,8 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
                 .flatten());
             
             for i in page.inodes.iter().cloned() {
-                vec.extend_from_slice(&i.0.to_le_bytes()[..]);
-                vec.extend_from_slice(&i.1.to_le_bytes()[..]);
+                vec.extend_from_slice(&i.length.to_le_bytes()[..]);
+                vec.extend_from_slice(&i.offset.to_le_bytes()[..]);
             }
         }
         
@@ -486,26 +498,29 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(vec)
     }
     
-    // TODO: Refactor to make returning multiple chunks which add up to `min_space`
-    pub(crate) fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<(u64, u64)>> {        
+    // TODO: Refactor to make returning multiple chunks which add up to `min_space` possible
+    pub(crate) fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {        
         // TODO: Determine clean way determine space before first inode
         
         let mut inodes = self.inode_table.values()
             .map(|i| i.inodes.iter())
             .flatten()
             .cloned()
-            .scan((0u64, 0u64), |a, i| {
+            .scan(Array { length: 0u64, offset: 0u64 }, |a, i| {
                 // The gap is the the start of the current + length => the start of the next
-                let out = Some((a.0 + a.1, i.0 - (a.0 + a.1)));
+                let out = Some(Array {
+                    length: i.offset - (a.offset + a.length),
+                    offset: a.offset + a.length
+                });
                 *a = i;
                 return out;
             })
             .collect::<Vec<_>>();
-        inodes.sort_unstable_by(|i, j| Ord::cmp(&i.1, &j.1));
+        inodes.sort_unstable_by(|i, j| Ord::cmp(&i.length, &j.length));
         
         if let Some(inode) = inodes.iter()
-            .find(|i| i.1 >= min_space) {
-            Ok(vec![(inode.0, min_space)])
+            .find(|i| i.length >= min_space) {
+            Ok(vec![Array { offset: inode.offset, length: min_space }])
         } else {
             // todo!("Expand file to make room for new chunk")
             let mut backing = self.backing.try_borrow_mut()
@@ -514,7 +529,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             let position = backing.seek(SeekFrom::End(0))?;
             backing.write_all(&vec![0u8; (min_space + (0x1000 - min_space % 0x1000)) as usize])?;
             
-            Ok(vec![(position, min_space)])
+            Ok(vec![Array {offset: position, length: min_space }])
         }
     }
     
