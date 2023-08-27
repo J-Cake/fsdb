@@ -463,9 +463,9 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
                 
             vec.extend((&[
                 &u64::to_le_bytes(self.get_strtab_index(&page.name)?)[..],
-                &u64::to_le_bytes(page.access_control_list.len() as u64)[..],
+                &u16::to_le_bytes(page.access_control_list.len() as u16)[..],
                 &acls[..],
-                &vec![0x00; 0x10 - (acls.len() * (1 + 8) % 0x10)][..],
+                &vec![0x00; round(2 + (1 + 8) * acls.len() as u64, 0x10) as usize][..],
                 &u64::to_le_bytes(page.inodes.len() as u64)[..],
             ][..])
                 .iter()
