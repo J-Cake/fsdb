@@ -7,6 +7,7 @@ use std::io::Write;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Result;
+use std::iter;
 use std::ops::DerefMut;
 use std::ops::Deref;
 use std::time::SystemTime;
@@ -30,13 +31,14 @@ macro_rules! str {
 
 /// A proxy which provides a reading and writing interface to the database's buffer.
 #[derive(Clone)]
-pub(crate) struct DBAgent<Buffer, Allocate> 
+pub(crate) struct DBAgent<'db, Buffer, Metadata, GetDBMut> 
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<Array>>
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut Database<Buffer, Metadata>
 {
     buffer: Rc<RefCell<Buffer>>,
-    allocate: Allocate
+    get_db: GetDBMut
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -45,10 +47,11 @@ pub struct Array {
     pub offset: u64,
 }
 
-impl<Buffer, Allocate> DBAgent<Buffer, Allocate> 
+impl<'db, Buffer, Metadata, GetDBMut> DBAgent<'db, Buffer, Metadata, GetDBMut> 
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<Array>>
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut Database<Buffer, Metadata>    
 {
     pub fn try_borrow_mut(&self) -> Result<RefMut<Buffer>> {
         self.buffer.try_borrow_mut()
@@ -65,7 +68,11 @@ where
     }
     
     pub fn allocate_chunks(&mut self, min_size: u64) -> Result<Vec<Array>> {
-        (self.allocate)(min_size)
+        (self.get_db)().allocate_chunks(min_size)
+    }
+    
+    pub fn flush(&mut self) -> Result<()> {
+        (self.get_db)().write_header()
     }
 }
 
@@ -79,9 +86,15 @@ pub struct Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadat
     pub(crate) string_table_range: Array,
     /// Number of elements in history table + Offset
     pub(crate) history_table_range: Array,
+    /// Number of elements in history table + Offset
+    pub(crate) metadata_range: Array,
     
     inode_table: HashMap<String, PageDescriptor>,
     string_table: RefCell<Vec<String>>,
+    
+    inode_table_size: u64,
+    string_table_size: u64,
+    history_table_size: u64,
     
     raw_header: Vec<u8>,
     pub meta: Metadata
@@ -124,37 +137,48 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
                 .map_err(Error::other)?)
         };
         
+        let metadata_range = Array {
+            length: u64::from_le_bytes(buf[64..72]
+                    .try_into()
+                    .map_err(Error::other)?), 
+            offset: u64::from_le_bytes(buf[72..80]
+                    .try_into()
+                    .map_err(Error::other)?)
+        };
+        
         let backing = Rc::new(RefCell::new(backing));
         
-        let strtab = RefCell::new(Self::parse_string_table(Rc::clone(&backing)
+        let strtab = Self::parse_string_table(Rc::clone(&backing)
             .try_borrow_mut()
-            .map_err(Error::other)?, string_table_range)?);
+            .map_err(Error::other)?, string_table_range)?;
+        let string_table_size = strtab.len() as u64;
+        let strtab = RefCell::new(strtab);
         
         let inodetab = Self::parse_inode_table(Rc::clone(&backing)
             .try_borrow_mut()
             .map_err(Error::other)?, strtab.borrow(), inode_table_range)?;
         
         let x = Ok(Self {
+            inode_table_size: inodetab.len() as u64,
+            string_table_size,
+            history_table_size: 0,
+            
             inode_table: inodetab,
             string_table: strtab,
             
             inode_table_range,
             string_table_range,
             history_table_range,
+            metadata_range,
+            
             raw_header: buf.clone(),
             meta: {
-                let meta = (u64::from_le_bytes(buf[64..72]
-                    .try_into()
-                    .map_err(Error::other)?), u64::from_le_bytes(buf[72..80]
-                    .try_into()
-                    .map_err(Error::other)?));
-                    
-                let mut s = vec![0u8; meta.0 as usize];
+                let mut s = vec![0u8; metadata_range.length as usize];
                 let mut backing: RefMut<Buffer> = backing
                     .try_borrow_mut()
                     .map_err(Error::other)?;
                     
-                backing.seek(SeekFrom::Start(meta.1))?;
+                backing.seek(SeekFrom::Start(metadata_range.offset))?;
                 backing.read_exact(&mut s)?;
                 
                 ron::de::from_bytes::<Metadata>(&s)
@@ -168,15 +192,22 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         return x;
     }
     
+    
+    fn data_offset(&self) -> u64 {        
+        (self.inode_table_range.offset + self.inode_table_size)
+            .max(self.string_table_range.offset + self.string_table_size)
+            // .max(self.history_table_range.offset + self.history_table_size) // TODO: Include once History Table becomes relevant
+            .max(self.metadata_range.offset + self.metadata_range.length)
+    }
+    
     pub fn blank<Meta>() -> Result<Database<Cursor<Vec<u8>>, Meta>> where Meta: Serialize + DeserializeOwned + Clone + Default {
         let metadata = Meta::default();
         let meta = ron::ser::to_string(&metadata)
             .map_err(Error::other)?
             .into_bytes();
             
-        let data_offset = (0x50u64 + meta.len() as u64)
-            .max(0x80);
-        let data_offset = data_offset + (0x10 - data_offset % 0x10);
+        let data_offset = round((0x50u64 + meta.len() as u64)
+            .max(0x80), 0x10);
         
         let mut header: Cursor<Vec<u8>> = Cursor::new(vec![
             &b"FSDB"[..], &u32::to_le_bytes(0x01)[..], &u64::to_le_bytes(0x00)[..],
@@ -201,6 +232,12 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             inode_table_range: Array { length: 1, offset: data_offset },
             string_table_range: Array { length: 2, offset: data_offset + 0x100 },
             history_table_range: Array { length: 1, offset: data_offset + 0x200 },
+            metadata_range: Array { length: meta.len() as u64, offset: 0x50 },
+           
+            inode_table_size: 0x20, // this value is found by ... just measuring... not elegant, but simpler/faster than computing it.
+            string_table_size: 0x12, // this value is also looked up.
+            history_table_size: 0, // history tab not defined yet
+           
             inode_table: vec![("/".to_string(), PageDescriptor {
                 name: "/".to_string(),
                 access_control_list: vec![crate::Access::ReadWriteExecute("*".to_string())],
@@ -266,7 +303,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             .map_err(Error::other)?, self.string_table_range)
     }
     
-    pub fn create_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<Array>> + 'a>>> {
+    pub fn create_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer, Metadata, Box<dyn FnMut() -> &'db mut Self + 'db>>> {
         let path = path.to_string();
         
         if self.inode_table.contains_key(&path) {
@@ -278,7 +315,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(crate::Page {
             db: DBAgent {
                 buffer: Rc::clone(&self.backing),
-                allocate: Box::new(|size| self.allocate_chunks(size))
+                get_db: Box::new(|| self)
             },
             page_descriptor: crate::PageDescriptor {
                 name: path,
@@ -292,7 +329,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         })
     }
     
-    pub fn open_page<'a, Path: ToString>(&'a mut self, path: Path) -> Result<crate::Page<Buffer, Box<dyn FnMut(u64) -> Result<Vec<Array>> + 'a>>> {
+    pub fn open_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer, Metadata, Box<dyn FnMut() -> &'db mut Self + 'db>>> {
         let path = path.to_string();
         
         let page = self.inode_table.get(&path)
@@ -302,7 +339,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(crate::Page {
             db: DBAgent {
                 buffer: Rc::clone(&self.backing),
-                allocate: Box::new(|size| self.allocate_chunks(size))
+                get_db: Box::new(|| self)
             },
             page_descriptor: page,
             index: 0,
@@ -418,7 +455,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         let history_offset = string_offset + string_length + 0x100 - (string_offset + string_length) % 0x100; // Align to next 0x100th byte
         let history_length = 0;
         
-        backing.write_all(&vec![inode_offset, inode_length, string_offset, string_length, history_offset, history_length]
+        backing.write_all(&vec![inode_length, inode_offset, string_length, string_offset, history_length, history_offset]
             .into_iter()
             .map(|i| i.to_le_bytes())
             .flatten()
@@ -427,7 +464,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(())
     }
     
-    fn serialise_inode_table(&self) -> Result<Vec<u8>> {
+    fn serialise_inode_table(&mut self) -> Result<Vec<u8>> {
         let mut vec = vec![];
         
         for (name, page) in self.inode_table.iter().map(|i| (i.0.clone(), i.1.clone())) {
@@ -478,10 +515,11 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             }
         }
         
+        self.inode_table_size = vec.len() as u64;
         Ok(vec)
     }
     
-    fn serialise_string_table(&self) -> Result<Vec<u8>> {
+    fn serialise_string_table(&mut self) -> Result<Vec<u8>> {
         let mut vec = vec![];
         
         for i in self.string_table.try_borrow().map_err(Error::other)?.iter() {
@@ -495,18 +533,35 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
                 .collect::<Vec<_>>());
         }
         
+        self.string_table_size = vec.len() as u64;
         Ok(vec)
+    }
+        
+    fn serialise_history_table(&mut self) -> Result<Vec<u8>> {
+        self.history_table_size = 0;
+        Ok(vec![])
     }
     
     // TODO: Refactor to make returning multiple chunks which add up to `min_space` possible
-    pub(crate) fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {        
-        // TODO: Determine clean way determine space before first inode
-        
+    pub(crate) fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {
+        let total_length: u64 = self.backing.try_borrow_mut()
+            .map_err(Error::other)?
+            .deref_mut()
+            .stream_len()? as u64;
+            
         let mut inodes = self.inode_table.values()
             .map(|i| i.inodes.iter())
             .flatten()
             .cloned()
-            .scan(Array { length: 0u64, offset: 0u64 }, |a, i| {
+            .chain(iter::once(Array { length: 0, offset: self.data_offset() }))
+            .chain(iter::once(Array { length: 0, offset: total_length }))
+            .collect::<Vec<_>>();
+    
+        inodes.sort_unstable_by(|i, j| Ord::cmp(&i.offset, &j.offset));
+                
+        let mut inodes = inodes
+            .into_iter()
+            .scan(Array { length: 0u64, offset: self.data_offset() }, |a, i| {
                 // The gap is the the start of the current + length => the start of the next
                 let out = Some(Array {
                     length: i.offset - (a.offset + a.length),
@@ -539,6 +594,10 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             inode_table_range: self.inode_table_range,
             string_table_range: self.string_table_range,
             history_table_range: self.history_table_range,
+            inode_table_size: self.inode_table_size,
+            string_table_size: self.string_table_size,
+            history_table_size: self.history_table_size,
+            metadata_range: self.metadata_range,
             inode_table: self.inode_table,
             string_table: self.string_table,
             raw_header: self.raw_header,

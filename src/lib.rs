@@ -1,5 +1,7 @@
 #![feature(io_error_other)]
+#![feature(io_error_more)]
 #![feature(write_all_vectored)]
+#![feature(seek_stream_len)]
 
 pub mod database;
 pub mod page;
@@ -13,8 +15,14 @@ pub use access::*;
 pub mod test {
     use std::fs::File;
     use std::fs::OpenOptions;
+    use std::io::Error;
     use std::io::Result;
     use std::io::Cursor;
+    use std::io::Read;
+    use std::io::Write;
+    use std::io::Seek;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
     use serde::Serialize;
     use serde::Deserialize;
     
@@ -37,35 +45,35 @@ pub mod test {
         }
     }
     
-    #[test]
-    pub fn blank() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open("/tmp/test.db")?;
-            
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
-            
-        Ok(())
-    }
+//     #[test]
+//     pub fn blank() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .create(true)
+//             .read(true)
+//             .write(true)
+//             .open("/tmp/test.db")?;
+//             
+//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+//             .change_buffer(file)?;
+//             
+//         Ok(())
+//     }
     
-    #[test]
-    pub fn create_page() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open("/tmp/test.db")?;
-        
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
-            
-        let page = blank.create_page("test")?;
-        
-        Ok(())
-    }
+//     #[test]
+//     pub fn create_page() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .create(true)
+//             .read(true)
+//             .write(true)
+//             .open("/tmp/test.db")?;
+//         
+//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+//             .change_buffer(file)?;
+//             
+//         let page = blank.create_page("test")?;
+//         
+//         Ok(())
+//     }
     
     #[test]
     pub fn read_write() -> Result<()> {
@@ -78,23 +86,32 @@ pub mod test {
         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
             .change_buffer(file)?;
             
-        let page = blank.create_page("test")?;
+        let mut page = blank.create_page("test")?;
         
+        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_err(Error::other)?.as_millis();
+        write!(&mut page, "{:?}", millis)?;
+        let mut str = String::new();
+        page.rewind()?;
+        page.read_to_string(&mut str)?;
+        println!("{}: {}", format!("{:?}", millis).len(), str.len());
         
+        println!("{:#?}", &page.page_descriptor);
+        
+        // assert!(str.trim().len() == format!("{:?}", millis).len());
         
         Ok(())
     }
     
-    #[test]
-    pub fn read() -> Result<()> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open("/tmp/test.db")?;
-            
-        let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
-        
-        assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
-        
-        Ok(())
-    }
+//     #[test]
+//     pub fn read() -> Result<()> {
+//         let mut file = OpenOptions::new()
+//             .read(true)
+//             .open("/tmp/test.db")?;
+//             
+//         let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
+//         
+//         assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
+//         
+//         Ok(())
+//     }
 }

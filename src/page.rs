@@ -1,9 +1,13 @@
+use std::io::Error;
 use std::io::SeekFrom;
 use std::io::Read;
 use std::io::Write;
 use std::io::Seek;
 use std::io::Result;
 use std::time::SystemTime;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Metadata about the page it describes.
 #[derive(Debug, Clone)]
@@ -48,22 +52,24 @@ pub enum HistoryEntry<'a> {
 }
 
 /// A Read/Write handle to the page's underlying data. Analogous to a File
-pub struct Page<'a, Buffer, Allocate>
+pub struct Page<'db, Buffer, Metadata, GetDBMut>
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
 {
-    pub(crate) db: crate::DBAgent<Buffer, Allocate>,
-    pub(crate) history: &'a [(SystemTime, HistoryEntry<'a>)],
+    pub(crate) db: crate::DBAgent<'db, Buffer, Metadata, GetDBMut>,
+    pub(crate) history: &'db [(SystemTime, HistoryEntry<'db>)],
     pub(crate) page_descriptor: PageDescriptor,
     
     pub(crate) index: u64
 }
 
-impl<'a, Buffer, Allocate> Seek for Page<'a, Buffer, Allocate> 
+impl<'db, Buffer, Metadata, GetDBMut> Seek for Page<'db, Buffer, Metadata, GetDBMut> 
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
 {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
@@ -87,10 +93,11 @@ where
     }
 }
 
-impl<'a, Buffer, Allocate> Read for Page<'a, Buffer, Allocate> 
+impl<'db, Buffer, Metadata, GetDBMut> Read for Page<'db, Buffer, Metadata, GetDBMut> 
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut running_size: u64 = 0;
@@ -115,10 +122,11 @@ where
     }
 }
 
-impl<'a, Buffer, Allocate> Write for Page<'a, Buffer, Allocate> 
+impl<'db, Buffer, Metadata, GetDBMut> Write for Page<'db, Buffer, Metadata, GetDBMut> 
 where 
-    Buffer: Read + Write + Seek,
-    Allocate: FnMut(u64) -> Result<Vec<crate::Array>> 
+    Buffer: 'db + Read + Write + Seek,
+    Metadata: 'db + Serialize + DeserializeOwned + Clone,
+    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         {
@@ -142,8 +150,20 @@ where
         }
         
         let chunks = self.db.allocate_chunks(buf.len() as u64)?;
+        let len = {
+            self.page_descriptor.inodes.extend(chunks.iter());
+            let mut backing = self.db.try_transparent_borrow_mut()?;
+            let first = chunks.first().ok_or(Error::new(std::io::ErrorKind::StorageFull, format!("Required {:?}B more", buf.len())))?;
+            
+            backing.seek(SeekFrom::Start(first.offset))?;
+            
+            backing.write_all(&buf[0..first.length as usize])?;
+            first.length as usize
+        };
         
-        Ok(0)
+        self.flush()?;
+        
+        Ok(len as usize)
     }
     
     fn flush(&mut self) -> std::io::Result<()> {
