@@ -6,10 +6,12 @@
 pub mod database;
 pub mod page;
 pub mod access;
+pub mod agent;
 
 pub use database::*;
 pub use page::*;
 pub use access::*;
+pub use agent::*;
 
 #[cfg(test)]
 pub mod test {

@@ -29,51 +29,10 @@ macro_rules! str {
     ($strtab:expr, $n:expr) => ($strtab.get($n as usize).ok_or(Error::new(std::io::ErrorKind::NotFound, format!("No string found for index {}", $n))));
 }
 
-/// A proxy which provides a reading and writing interface to the database's buffer.
-#[derive(Clone)]
-pub(crate) struct DBAgent<'db, Buffer, Metadata, GetDBMut> 
-where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut Database<Buffer, Metadata>
-{
-    buffer: Rc<RefCell<Buffer>>,
-    get_db: GetDBMut
-}
-
 #[derive(Copy, Clone, Debug)]
 pub struct Array {
     pub length: u64,
     pub offset: u64,
-}
-
-impl<'db, Buffer, Metadata, GetDBMut> DBAgent<'db, Buffer, Metadata, GetDBMut> 
-where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut Database<Buffer, Metadata>    
-{
-    pub fn try_borrow_mut(&self) -> Result<RefMut<Buffer>> {
-        self.buffer.try_borrow_mut()
-            .map_err(Error::other)
-    }
-    
-    pub fn try_transparent_borrow_mut(&mut self) -> Result<RefMut<Buffer>> {
-        self.try_borrow_mut()
-    }
-    
-    pub fn try_borrow(&self) -> Result<Ref<Buffer>> {
-        self.buffer.try_borrow()
-            .map_err(Error::other)
-    }
-    
-    pub fn allocate_chunks(&mut self, min_size: u64) -> Result<Vec<Array>> {
-        (self.get_db)().allocate_chunks(min_size)
-    }
-    
-    pub fn flush(&mut self) -> Result<()> {
-        (self.get_db)().write_header()
-    }
 }
 
 /// Contains information about the database, providing a clean interface to accessing it
@@ -303,7 +262,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             .map_err(Error::other)?, self.string_table_range)
     }
     
-    pub fn create_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer, Metadata, Box<dyn FnMut() -> &'db mut Self + 'db>>> {
+    pub fn create_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<'db, Buffer>> {
         let path = path.to_string();
         
         if self.inode_table.contains_key(&path) {
@@ -313,10 +272,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         let data = self.allocate_chunks(0x10)?;
     
         Ok(crate::Page {
-            db: DBAgent {
-                buffer: Rc::clone(&self.backing),
-                get_db: Box::new(|| self)
-            },
+            db: crate::DBAgent::from_existing(Rc::clone(&self.backing)),
             page_descriptor: crate::PageDescriptor {
                 name: path,
                 access_control_list: [crate::Access::ReadWriteExecute("*".to_owned())].to_vec(),
@@ -329,7 +285,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         })
     }
     
-    pub fn open_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer, Metadata, Box<dyn FnMut() -> &'db mut Self + 'db>>> {
+    pub fn open_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer>> {
         let path = path.to_string();
         
         let page = self.inode_table.get(&path)
@@ -337,10 +293,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             .clone();
             
         Ok(crate::Page {
-            db: DBAgent {
-                buffer: Rc::clone(&self.backing),
-                get_db: Box::new(|| self)
-            },
+            db: crate::DBAgent::from_existing(Rc::clone(&self.backing)),
             page_descriptor: page,
             index: 0,
             history: &[] // TODO: fetch history
@@ -543,7 +496,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
     }
     
     // TODO: Refactor to make returning multiple chunks which add up to `min_space` possible
-    pub(crate) fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {
+    fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {
         let total_length: u64 = self.backing.try_borrow_mut()
             .map_err(Error::other)?
             .deref_mut()

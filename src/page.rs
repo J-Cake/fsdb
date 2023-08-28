@@ -25,7 +25,7 @@ pub(crate) struct PageDescriptor {
 }
 
 /// Information about what happened, when
-pub enum HistoryEntry<'a> {
+pub enum HistoryEntry<'db> {
     /// The page was created
     Created,
     /// The following range of data was modified 
@@ -33,9 +33,9 @@ pub enum HistoryEntry<'a> {
         start: u64,
         len: u64,
         /// The previous content contained between start and start + len
-        content: Option<&'a [u8]>,
+        content: Option<&'db [u8]>,
         /// The hash of the previous content
-        hash: Option<&'a [u8]>
+        hash: Option<&'db [u8]>
     },
     /// The access list of the page was altered
     AccessModified {
@@ -52,24 +52,20 @@ pub enum HistoryEntry<'a> {
 }
 
 /// A Read/Write handle to the page's underlying data. Analogous to a File
-pub struct Page<'db, Buffer, Metadata, GetDBMut>
+pub struct Page<'db, Buffer>
 where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
+    Buffer: Read + Write + Seek,
 {
-    pub(crate) db: crate::DBAgent<'db, Buffer, Metadata, GetDBMut>,
+    pub(crate) db: crate::DBAgent<Buffer>,
     pub(crate) history: &'db [(SystemTime, HistoryEntry<'db>)],
     pub(crate) page_descriptor: PageDescriptor,
     
     pub(crate) index: u64
 }
 
-impl<'db, Buffer, Metadata, GetDBMut> Seek for Page<'db, Buffer, Metadata, GetDBMut> 
+impl<'db, Buffer> Seek for Page<'db, Buffer> 
 where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
+    Buffer: Read + Write + Seek,
 {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
@@ -93,11 +89,9 @@ where
     }
 }
 
-impl<'db, Buffer, Metadata, GetDBMut> Read for Page<'db, Buffer, Metadata, GetDBMut> 
+impl<'db, Buffer> Read for Page<'db, Buffer> 
 where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
+    Buffer: Read + Write + Seek,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut running_size: u64 = 0;
@@ -122,11 +116,9 @@ where
     }
 }
 
-impl<'db, Buffer, Metadata, GetDBMut> Write for Page<'db, Buffer, Metadata, GetDBMut> 
+impl<'db, Buffer> Write for Page<'db, Buffer> 
 where 
-    Buffer: 'db + Read + Write + Seek,
-    Metadata: 'db + Serialize + DeserializeOwned + Clone,
-    GetDBMut: FnMut() -> &'db mut crate::Database<Buffer, Metadata>
+    Buffer: Read + Write + Seek,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         {
@@ -167,8 +159,6 @@ where
     }
     
     fn flush(&mut self) -> std::io::Result<()> {
-        self.db.try_borrow_mut()?.flush()?;
-            
-        Ok(())
+        todo!();
     }
 }
