@@ -1,11 +1,14 @@
 use std::io::Error;
-use std::io::SeekFrom;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::io::Seek;
-use std::io::Result;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::Receiver;
 use std::time::SystemTime;
-
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -24,141 +27,86 @@ pub(crate) struct PageDescriptor {
     pub(crate) inodes: Vec<crate::Array>
 }
 
-/// Information about what happened, when
-pub enum HistoryEntry<'db> {
-    /// The page was created
-    Created,
-    /// The following range of data was modified 
-    Modified {
-        start: u64,
-        len: u64,
-        /// The previous content contained between start and start + len
-        content: Option<&'db [u8]>,
-        /// The hash of the previous content
-        hash: Option<&'db [u8]>
-    },
-    /// The access list of the page was altered
-    AccessModified {
-        /// The previous access list
-        prev_acl: Vec<crate::Access>
-    },
-    /// The page's inode table was modified
-    INodeListModified {
-        /// The previous inode list
-        prev_inodes: Vec<crate::Array>
-    },
-    /// The page was deleted
-    Deleted
+pub enum SpaceRequirements {
+    GrowBy(u64),
+    SetLen(u64)
 }
 
-/// A Read/Write handle to the page's underlying data. Analogous to a File
-pub struct Page<'db, Buffer>
-where 
-    Buffer: Read + Write + Seek,
+pub enum ACLOperation {
+    Add(crate::Access),
+    Remove(crate::Access),
+    Alter(crate::Access)
+}
+
+pub enum PageRequest {
+    RefreshChunks,
+    AllocateSpace(SpaceRequirements),
+    ChangeACL(ACLOperation),
+    Close,
+}
+
+enum Response {
+    Ok,
+    Busy,
+    NotPermitted,
+}
+
+pub struct PageResponse {
+    request: PageRequest,
+    response: Response
+}
+
+pub struct Page<Backing, Metadata>
+where
+    Backing: Read + Write + Seek,
+    Metadata: Serialize + DeserializeOwned + Clone 
 {
-    pub(crate) db: crate::DBAgent<Buffer>,
-    pub(crate) history: &'db [(SystemTime, HistoryEntry<'db>)],
-    pub(crate) page_descriptor: PageDescriptor,
+    pub(crate) chunks: Arc<Mutex<Vec<crate::MutexChunk<Backing>>>>,
+    pub(crate) sender: Sender<PageRequest>,
+    pub(crate) receiver: Receiver<PageResponse>,
+    pub(crate) page_descriptor: Arc<Mutex<PageDescriptor>>,
     
-    pub(crate) index: u64
+    offset: u64
 }
 
-impl<'db, Buffer> Seek for Page<'db, Buffer> 
-where 
-    Buffer: Read + Write + Seek,
+impl<Backing, Metadata> Page<Backing, Metadata>
+where
+    Backing: Read + Write + Seek,
+    Metadata: Serialize + DeserializeOwned + Clone
 {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match pos {
-            SeekFrom::Start(start) => self.index = start,
-            SeekFrom::Current(offset) => if -offset > self.index as i64 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek beyond beginning"));
-            } else {
-                self.index = (self.index as i64 + offset) as u64;
-            },
-            SeekFrom::End(offset) => {
-                let total = self.page_descriptor.inodes.iter().map(|i| i.length).sum::<u64>() as i64;
-                if -offset > total as i64 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek beyond end"));
-                } else {
-                    self.index = (total + offset) as u64;
-                }                    
-            }
-        };
-        
-        Ok(self.index)
-    }
+    
 }
 
-impl<'db, Buffer> Read for Page<'db, Buffer> 
-where 
-    Buffer: Read + Write + Seek,
-{
+impl<Backing, Metadata> Read for Page<Backing, Metadata> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut running_size: u64 = 0;
-        let mut backing = self.db.try_borrow_mut()?;
+        // TODO: Optimise away unnecessary mutex locks
+        let chunks = match self.chunks.lock() {
+                Ok(chunk) => chunk,
+                Err(err) => return Error::new(ErrorKind::ResourceBusy, format!("Page busy"))
+            }.iter()
+            .map(|i| i.lock().map_err(|| Error::new(ErrorKind::ResourceBusy, format!("Page busy"))))
+            .collect::<Result<Vec<crate::Chunk<Backing>>>>()?
+            .into_iter()
+            .skip_while(|i| i.bounds.offset + i.bounds.length > self.offset);
             
-        for crate::Array { length: len, offset: start } in self.page_descriptor.inodes
-            .iter() {
+        let mut buf_offset = 0usize;
+        while buf_offset < buf.len() {
+            if let Some(chunk) = chunks.next() {
+                let start: usize = (self.offset - chunk.bounds.offset) as usize;
+                let len: usize = chunk.buffer.len().min((self.offset as usize + buf.len()) - start);
+                let src = &chunk.buffer[start..start + len];
                 
-            // Read at most one chunk
-            if running_size + len > self.index {
-                backing.seek(SeekFrom::Start(start + (self.index - running_size)))?;
-                let len = (*len as usize).min(buf.len());
-                backing.read_exact(&mut buf[0..len])?;
-                self.index += len as u64;
-                return Ok(len);
+                (&mut buf[buf_offset..src.len()]).copy_from_slice(&src);
+                buf_offset += src.len();
+                self.offset += src.len();
+            } else {
+                return Ok(buf_offset)
             }
-            
-            running_size += len;
         }
         
-        Ok(0)
+        Ok(buf_offset)
     }
 }
 
-impl<'db, Buffer> Write for Page<'db, Buffer> 
-where 
-    Buffer: Read + Write + Seek,
-{
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        {
-            let mut running_size: u64 = 0;
-            let mut backing = self.db.try_transparent_borrow_mut()?;
-                
-            for crate::Array { length: len, offset: start } in self.page_descriptor.inodes
-                .iter() {
-                    
-                // Read at most one chunk
-                if running_size + len > self.index {
-                    backing.seek(SeekFrom::Start(start + (self.index - running_size)))?;
-                    let len = (*len as usize).min(buf.len());
-                    backing.write_all(&buf[0..len])?;
-                    self.index += len as u64;
-                    return Ok(len);
-                }
-                
-                running_size += len;
-            }
-        }
-        
-        let chunks = self.db.allocate_chunks(buf.len() as u64)?;
-        let len = {
-            self.page_descriptor.inodes.extend(chunks.iter());
-            let mut backing = self.db.try_transparent_borrow_mut()?;
-            let first = chunks.first().ok_or(Error::new(std::io::ErrorKind::StorageFull, format!("Required {:?}B more", buf.len())))?;
-            
-            backing.seek(SeekFrom::Start(first.offset))?;
-            
-            backing.write_all(&buf[0..first.length as usize])?;
-            first.length as usize
-        };
-        
-        self.flush()?;
-        
-        Ok(len as usize)
-    }
-    
-    fn flush(&mut self) -> std::io::Result<()> {
-        todo!();
-    }
-}
+// TODO: Write + Seek impls
+

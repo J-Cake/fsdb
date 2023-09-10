@@ -7,9 +7,10 @@ use std::io::Write;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Result;
-use std::iter;
 use std::ops::DerefMut;
 use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::SystemTime;
 use std::cell::RefCell;
 use std::cell::RefMut;
@@ -35,6 +36,12 @@ pub struct Array {
     pub offset: u64,
 }
 
+impl Ord for Array {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.offset.cmp(&other.offset)
+    }
+}
+
 /// Contains information about the database, providing a clean interface to accessing it
 pub struct Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadata: Serialize + DeserializeOwned + Clone {
     /// The underlying data source. As long as it supports Read, Write and Seek operations, this can be anything.
@@ -48,12 +55,14 @@ pub struct Database<Buffer, Metadata> where Buffer: Read + Write + Seek, Metadat
     /// Number of elements in history table + Offset
     pub(crate) metadata_range: Array,
     
-    inode_table: HashMap<String, PageDescriptor>,
+    inode_table: HashMap<String, crate::PageDescriptor>,
     string_table: RefCell<Vec<String>>,
     
     inode_table_size: u64,
     string_table_size: u64,
     history_table_size: u64,
+    
+    borrowed_slices: Arc<Mutex<Vec<Array>>>,
     
     raw_header: Vec<u8>,
     pub meta: Metadata
@@ -130,6 +139,8 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             history_table_range,
             metadata_range,
             
+            borrowed_slices: Arc::new(Mutex::new(vec![])),
+            
             raw_header: buf.clone(),
             meta: {
                 let mut s = vec![0u8; metadata_range.length as usize];
@@ -196,6 +207,8 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             inode_table_size: 0x20, // this value is found by ... just measuring... not elegant, but simpler/faster than computing it.
             string_table_size: 0x12, // this value is also looked up.
             history_table_size: 0, // history tab not defined yet
+           
+           borrowed_slices: Arc::new(Mutex::new(vec![])),
            
             inode_table: vec![("/".to_string(), PageDescriptor {
                 name: "/".to_string(),
@@ -271,18 +284,25 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         
         let data = self.allocate_chunks(0x10)?;
     
-        Ok(crate::Page {
-            db: crate::DBAgent::from_existing(Rc::clone(&self.backing)),
-            page_descriptor: crate::PageDescriptor {
-                name: path,
-                access_control_list: [crate::Access::ReadWriteExecute("*".to_owned())].to_vec(),
-                modified: SystemTime::now(),
-                created: SystemTime::now(),
-                inodes: data
-            },
-            index: 0,
-            history: &[] // TODO: Autofill with created event
-        })
+        todo!();
+        // Ok(crate::Page {
+        //     chunks: ,
+        //     sender: todo!(),
+        //     receiver: todo!(),
+        // })
+        
+        // Ok(crate::Page {
+        //     db: crate::DBAgent::from_existing(Rc::clone(&self.backing)),
+        //     page_descriptor: crate::PageDescriptor {
+        //         name: path,
+        //         access_control_list: [crate::Access::ReadWriteExecute("*".to_owned())].to_vec(),
+        //         modified: SystemTime::now(),
+        //         created: SystemTime::now(),
+        //         inodes: data
+        //     },
+        //     index: 0,
+        //     history: &[] // TODO: Autofill with created event
+        // })
     }
     
     pub fn open_page<'db, Path: ToString>(&'db mut self, path: Path) -> Result<crate::Page<Buffer>> {
@@ -293,10 +313,7 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             .clone();
             
         Ok(crate::Page {
-            db: crate::DBAgent::from_existing(Rc::clone(&self.backing)),
-            page_descriptor: page,
-            index: 0,
-            history: &[] // TODO: fetch history
+            
         })
     }
     
@@ -495,6 +512,8 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
         Ok(vec![])
     }
     
+    // fn receive_msg(&mut self, )
+    
     // TODO: Refactor to make returning multiple chunks which add up to `min_space` possible
     fn allocate_chunks(&mut self, min_space: u64) -> Result<Vec<Array>> {
         let total_length: u64 = self.backing.try_borrow_mut()
@@ -539,6 +558,14 @@ impl<Buffer, Metadata> Database<Buffer, Metadata> where Buffer: Read + Write + S
             
             Ok(vec![Array {offset: position, length: min_space }])
         }
+    }
+    
+    fn grow(&mut self, page: &PageDescriptor, min_space: u64) -> Result<()> {
+        if let Some(page) = self.inode_table.get_mut(&page.name) {
+            
+        }
+        
+        Ok(())
     }
     
     pub fn change_buffer<NewBuffer>(self, buffer: NewBuffer) -> Result<Database<NewBuffer, Metadata>> where NewBuffer: Read + Write + Seek {

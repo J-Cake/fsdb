@@ -7,11 +7,12 @@ pub mod database;
 pub mod page;
 pub mod access;
 pub mod agent;
+pub(crate) mod mediator;
 
 pub use database::*;
-pub use page::*;
 pub use access::*;
-pub use agent::*;
+pub use page::*;
+pub(crate) use mediator::*;
 
 #[cfg(test)]
 pub mod test {
@@ -47,35 +48,35 @@ pub mod test {
         }
     }
     
-//     #[test]
-//     pub fn blank() -> Result<()> {
-//         let mut file = OpenOptions::new()
-//             .create(true)
-//             .read(true)
-//             .write(true)
-//             .open("/tmp/test.db")?;
-//             
-//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-//             .change_buffer(file)?;
-//             
-//         Ok(())
-//     }
+    #[test]
+    pub fn blank() -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open("/tmp/test.db")?;
+            
+        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+            .change_buffer(file)?;
+            
+        Ok(())
+    }
     
-//     #[test]
-//     pub fn create_page() -> Result<()> {
-//         let mut file = OpenOptions::new()
-//             .create(true)
-//             .read(true)
-//             .write(true)
-//             .open("/tmp/test.db")?;
-//         
-//         let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-//             .change_buffer(file)?;
-//             
-//         let page = blank.create_page("test")?;
-//         
-//         Ok(())
-//     }
+    #[test]
+    pub fn create_page() -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open("/tmp/test.db")?;
+        
+        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+            .change_buffer(file)?;
+            
+        let page = blank.create_page("test")?;
+        
+        Ok(())
+    }
     
     #[test]
     pub fn read_write() -> Result<()> {
