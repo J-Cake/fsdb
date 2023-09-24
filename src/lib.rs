@@ -7,11 +7,15 @@ pub mod database;
 pub mod page;
 pub mod access;
 pub mod agent;
+pub mod format;
+pub mod error;
 pub(crate) mod mediator;
 
 pub use database::*;
 pub use access::*;
 pub use page::*;
+pub use format::*;
+pub use error::*;
 pub(crate) use mediator::*;
 
 #[cfg(test)]
@@ -21,9 +25,6 @@ pub mod test {
     use std::io::Error;
     use std::io::Result;
     use std::io::Cursor;
-    use std::io::Read;
-    use std::io::Write;
-    use std::io::Seek;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use serde::Serialize;
@@ -56,8 +57,8 @@ pub mod test {
             .write(true)
             .open("/tmp/test.db")?;
             
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
+        let mut blank = crate::blank::<Metadata>()?
+            .change_backing(file);
             
         Ok(())
     }
@@ -70,8 +71,8 @@ pub mod test {
             .write(true)
             .open("/tmp/test.db")?;
         
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
-            .change_buffer(file)?;
+        let mut blank = crate::blank::<Metadata>()?
+            .change_backing(file);
             
         let page = blank.create_page("test")?;
         
@@ -105,16 +106,16 @@ pub mod test {
         Ok(())
     }
     
-//     #[test]
-//     pub fn read() -> Result<()> {
-//         let mut file = OpenOptions::new()
-//             .read(true)
-//             .open("/tmp/test.db")?;
-//             
-//         let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
-//         
-//         assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
-//         
-//         Ok(())
-//     }
+    #[test]
+    pub fn read() -> Result<()> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open("/tmp/test.db")?;
+            
+        let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
+        
+        assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
+        
+        Ok(())
+    }
 }

@@ -1,16 +1,7 @@
-use std::io::Error;
-use std::io::ErrorKind;
+use std::time::SystemTime;
+use std::io::Seek;
 use std::io::Read;
 use std::io::Write;
-use std::io::Seek;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
-use std::sync::mpsc::Sender;
-use std::sync::mpsc::Receiver;
-use std::time::SystemTime;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 /// Metadata about the page it describes.
 #[derive(Debug, Clone)]
@@ -56,57 +47,35 @@ pub struct PageResponse {
     response: Response
 }
 
-pub struct Page<Backing, Metadata>
-where
-    Backing: Read + Write + Seek,
-    Metadata: Serialize + DeserializeOwned + Clone 
-{
-    pub(crate) chunks: Arc<Mutex<Vec<crate::MutexChunk<Backing>>>>,
-    pub(crate) sender: Sender<PageRequest>,
-    pub(crate) receiver: Receiver<PageResponse>,
-    pub(crate) page_descriptor: Arc<Mutex<PageDescriptor>>,
-    
-    offset: u64
+pub struct Page {
+    descriptor: PageDescriptor
 }
 
-impl<Backing, Metadata> Page<Backing, Metadata>
-where
-    Backing: Read + Write + Seek,
-    Metadata: Serialize + DeserializeOwned + Clone
-{
+impl Page {
     
 }
 
-impl<Backing, Metadata> Read for Page<Backing, Metadata> {
+#[cfg(feature = "rwpage")]
+impl Read for Page {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // TODO: Optimise away unnecessary mutex locks
-        let chunks = match self.chunks.lock() {
-                Ok(chunk) => chunk,
-                Err(err) => return Error::new(ErrorKind::ResourceBusy, format!("Page busy"))
-            }.iter()
-            .map(|i| i.lock().map_err(|| Error::new(ErrorKind::ResourceBusy, format!("Page busy"))))
-            .collect::<Result<Vec<crate::Chunk<Backing>>>>()?
-            .into_iter()
-            .skip_while(|i| i.bounds.offset + i.bounds.length > self.offset);
-            
-        let mut buf_offset = 0usize;
-        while buf_offset < buf.len() {
-            if let Some(chunk) = chunks.next() {
-                let start: usize = (self.offset - chunk.bounds.offset) as usize;
-                let len: usize = chunk.buffer.len().min((self.offset as usize + buf.len()) - start);
-                let src = &chunk.buffer[start..start + len];
-                
-                (&mut buf[buf_offset..src.len()]).copy_from_slice(&src);
-                buf_offset += src.len();
-                self.offset += src.len();
-            } else {
-                return Ok(buf_offset)
-            }
-        }
-        
-        Ok(buf_offset)
+        todo!()
     }
 }
 
-// TODO: Write + Seek impls
+#[cfg(feature = "rwpage")]
+impl Write for Page {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        todo!()
+    }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        todo!()
+    }
+}
 
+#[cfg(feature = "rwpage")]
+impl Seek for Page {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        todo!()
+    }
+}

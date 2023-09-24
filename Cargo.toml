@@ -8,3 +8,10 @@ edition = "2021"
 [dependencies]
 serde = { version = "1.0.181", features = ["derive"] }
 ron = "0.8"
+memmap = "0.7.0"
+
+[features]
+default = ["rwpage"]
+rwpage = []
+sqapi = []
+fsapi = []
