@@ -1,105 +1,68 @@
-use std::io::Read;
-use std::io::Seek;
-use std::io::Write;
-use std::sync::mpsc::channel;
-use std::sync::Arc;
-use std::sync::Condvar;
+use std::io::{Read, Write, Seek};
 use std::sync::Mutex;
-use std::thread::JoinHandle;
 
-use crate::Array;
-use crate::Error;
+use crate::error::Error;
+use crate::format::Array;
 
-enum RequestAction {
-    Read,
-    Write,
-    Unload,
+pub enum RangeLock {
+    Read(Array),
+    Write(Array)
 }
 
-enum RequestStatus {
-    Pending,
-    Success,
-    Failed(Error),
-}
-
-impl RequestAction {
-    pub fn req(self, range: Array) -> Request {
-        Request {
-            action: self,
-            cvar: Arc::new((
-                Mutex::new((Vec::new(), RequestStatus::Pending)),
-                Condvar::new(),
-            )),
-            range,
+impl RangeLock {
+    fn get_range(&self) -> Array {
+        match self {
+            Self::Read(range) => *range,
+            Self::Write(range) => *range
         }
     }
 }
 
-struct Request {
-    action: RequestAction,
-    cvar: Arc<(Mutex<(Vec<u8>, RequestStatus)>, Condvar)>,
-    range: Array,
+pub(crate) struct Mediator<Backing> where Backing: Read + Write + Seek + 'static {
+    locks: Mutex<Vec<RangeLock>>,
+    backing: Mutex<Backing>
 }
 
-pub(crate) struct Mediator {
-    join_handle: JoinHandle<()>,
-}
+impl<Backing> Mediator<Backing> where Backing: Read + Write + Seek + 'static {
+    pub fn try_read_range<Buffer>(&self, mut buffer: Buffer, offset: u64) -> Result<(), Error> where Buffer: AsMut<[u8]> {
+        {
+            let mut locks = self.locks.try_lock()?;
+            if let None = locks.iter().find(|i| matches!(i, RangeLock::Write(range) if range.offset >= offset && range.end() < offset)) {
+                locks.push(RangeLock::Read(Array {
+                    offset,
+                    length: buffer.as_mut().len() as u64,
+                }));
+            } else {
+                return Err(Error::Busy);
+            }
+        }
 
-impl Mediator {
-    pub(crate) fn new<Backing>(backing: Backing) -> Result<Arc<Self>, Error>
-    where
-        Backing: Read + Write + Seek + Send,
-    {
-        let (send_request, receive_request) = channel::<Request>();
+        // I was hoping to avoid mutexes as they only allow a synchronised read/write operation.as
+        // However, coordinating read/writes does exactly the same thing, and adds lots of code.
+        // Plus the OS will synchronise read/writes across threads, so we ultimately gain nothing.
+        self.backing.try_lock()?.read_exact(buffer.as_mut())?;
 
-        Ok(Self {
-            join_handle: std::thread::spawn(move || -> Result<(), Error> {
-                let mut cache = Vec::<Box<(Array, [u8])>>::new();
-                let mut backing = backing;
-
-                // Continuously process incoming requests.
-                while let Ok(req) = receive_request.recv() {
-                    let cvar = Arc::clone(&req.cvar);
-                    let (mut buffer, mut status) = cvar.0.lock()?;
-
-                    let index = match cache.binary_search_by(|i| i.0.offset.cmp(*req.range.offset))
-                    {
-                        Ok(index) => index,
-                        Err(index) => index,
-                    };
-
-                    *status = if let Some(cache_entry) = cache.get(index) {
-                        if cache_entry.0.offset <= req.range.offset + req.range.length {
-                            RequestStatus::Failed(Error::Busy)
-                        }
-                    } else {                        
-                        let result = if let Err(err) = match req.action {
-                            RequestAction::Read => backing.read_exact(&mut buffer),
-                            RequestAction::Write => backing.write_all(&buffer),
-                            RequestAction::Unload => todo!(),
-                        } {
-                            RequestStatus::Failed(Error::Other("Failed to handle request"))
-                        } else {
-                            RequestStatus::Success
-                        };
-                        
-                        cache.insert(index, Box::new((req.range.clone(), buffer.clone())));
-                        result
-                    };
-                    
-                    cvar.1.notify_all();
-                }
-
-                Ok(())
-            }),
-        })
+        Ok(())
     }
 
-    pub fn get(&self, array: Array) -> Result<&[u8], Error> {
-        todo!();
-    }
+    pub fn try_write_range<Buffer>(&self, buffer: Buffer, offset: u64) -> Result<(), Error> where Buffer: AsRef<[u8]> {
+        {
+            let mut locks = self.locks.try_lock()?;
+            if let None = locks.iter().find(|i| i.get_range().offset >= offset && i.get_range().end() < offset) {
+                locks.push(RangeLock::Write(Array {
+                    offset,
+                    length: buffer.as_mut().len() as u64,
+                }));
+            } else {
+                return Err(Error::Busy);
+            }
+        }
 
-    pub fn get_mut(&mut self, array: Array) -> Result<&mut [u8], Error> {
-        todo!();
+        // I was hoping to avoid mutexes as they only allow a synchronised read/write operation.as
+        // However, coordinating read/writes does exactly the same thing, and adds lots of code.
+        // Plus the OS will synchronise read/writes across threads, so we ultimately gain nothing.
+        self.backing.try_lock()?.write_all(buffer.as_mut())?;
+
+        Ok(())
     }
 }

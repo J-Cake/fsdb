@@ -2,6 +2,7 @@
 #![feature(io_error_more)]
 #![feature(write_all_vectored)]
 #![feature(seek_stream_len)]
+#![feature(if_let_guard)]
 
 pub mod database;
 pub mod page;
@@ -10,13 +11,6 @@ pub mod agent;
 pub mod format;
 pub mod error;
 pub(crate) mod mediator;
-
-pub use database::*;
-pub use access::*;
-pub use page::*;
-pub use format::*;
-pub use error::*;
-pub(crate) use mediator::*;
 
 #[cfg(test)]
 pub mod test {
@@ -29,7 +23,8 @@ pub mod test {
     use std::time::UNIX_EPOCH;
     use serde::Serialize;
     use serde::Deserialize;
-    
+    use crate::database::Database;
+
     #[derive(Debug, Serialize, Deserialize, Clone)]
     struct Metadata {
         max_page_size: u64,
@@ -57,7 +52,7 @@ pub mod test {
             .write(true)
             .open("/tmp/test.db")?;
             
-        let mut blank = crate::blank::<Metadata>()?
+        let mut blank = Database::blank::<Metadata>()?
             .change_backing(file);
             
         Ok(())
@@ -71,7 +66,7 @@ pub mod test {
             .write(true)
             .open("/tmp/test.db")?;
         
-        let mut blank = crate::blank::<Metadata>()?
+        let mut blank = Database::blank::<Metadata>()?
             .change_backing(file);
             
         let page = blank.create_page("test")?;
@@ -87,7 +82,7 @@ pub mod test {
             .write(true)
             .open("/tmp/test.db")?;
         
-        let mut blank = crate::Database::<Cursor<Vec<u8>>, Metadata>::blank::<Metadata>()?
+        let mut blank = Database::blank::<Metadata>()?
             .change_buffer(file)?;
             
         let mut page = blank.create_page("test")?;
@@ -112,7 +107,7 @@ pub mod test {
             .read(true)
             .open("/tmp/test.db")?;
             
-        let mut db: crate::Database<File, Metadata> = crate::Database::open(file)?;
+        let mut db = Database::open(file)?;
         
         assert!(db.leak_string_table().len() as u64 == db.string_table_range.length);
         

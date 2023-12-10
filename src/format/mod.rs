@@ -1,5 +1,7 @@
 pub mod parse;
 pub mod serialise;
+pub mod database;
+mod array;
 
 use std::io::Error;
 use std::io::Cursor;
@@ -9,45 +11,17 @@ use std::io::Read;
 pub use parse::*;
 use serde::{Serialize, de::DeserializeOwned};
 pub use serialise::*;
+use crate::database::Database;
+use crate::format::array::round;
 
-#[inline]
-pub fn round(x: u64, n: u64) -> u64 {
-    x + (n - x % n)
-}
 
-#[derive(Copy, Clone, Debug)]
-pub struct Array {
-    pub length: u64,
-    pub offset: u64,
-}
-
-impl PartialEq for Array {
-    fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset
-    }
-}
-
-impl Eq for Array {}
-
-impl PartialOrd for Array {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(Ord::cmp(self, other))
-    }
-}
-
-impl Ord for Array {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.offset.cmp(&other.offset)
-    }
-}
-
-pub fn blank<Meta>() -> Result<crate::Database<Cursor<Vec<u8>>>> where Meta: Serialize + DeserializeOwned + Clone + Default {
+pub fn blank<Meta>() -> Result<Database<Cursor<Vec<u8>>>> where Meta: Serialize + DeserializeOwned + Clone + Default {
     let metadata = Meta::default();
     let meta = ron::ser::to_string(&metadata)
         .map_err(Error::other)?
         .into_bytes();
         
-    let data_offset = crate::round((0x50u64 + meta.len() as u64)
+    let data_offset = round((0x50u64 + meta.len() as u64)
         .max(0x80), 0x10);
     
     let mut header: Cursor<Vec<u8>> = Cursor::new(vec![
